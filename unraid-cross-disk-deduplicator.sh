@@ -1,7 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-# bash_duplicate_cleanup.sh
-#
 # This script identifies and manages duplicate files across specified disk mounts.
 # It prioritizes files located in paths containing "torrent" or "torrents" and
 # replaces other identical files on different disks with hardlinks to the

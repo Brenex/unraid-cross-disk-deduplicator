@@ -39,7 +39,12 @@ set -euo pipefail
 #
 
 # --- Configuration ---
-declare -a DISK_MOUNTS=("/mnt/disk3" "/mnt/disk4" "/mnt/disk5" "/mnt/disk6" "/mnt/disk7")
+# If disk paths are passed as arguments, use them. Otherwise, default to all /mnt/disk* paths.
+if [[ "$#" -gt 0 ]]; then
+    DISK_MOUNTS=("$@")
+else
+    DISK_MOUNTS=(/mnt/disk*)
+fi
 
 # Logging directory (relative to the script's location)
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")

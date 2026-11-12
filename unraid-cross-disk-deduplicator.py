@@ -26,7 +26,7 @@ import sys
 import uuid
 from collections import defaultdict
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 CHUNK = 1024 * 1024
 DISK_RE = re.compile(r"disk[1-9][0-9]*\Z")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -112,11 +112,13 @@ def unraid_owner():
 
 
 def normalized_mode(snapshot):
+    # Select the final mode by type. Directory traversal is never removed as
+    # an intermediate step in file permission repair.
     if stat.S_ISDIR(snapshot.st_mode):
         return 0o777
-    # Equivalent ordinary permission bits to chmod go-rwx,u-x,go+u.
-    owner_rw = stat.S_IMODE(snapshot.st_mode) & 0o600
-    return owner_rw | (owner_rw >> 3) | (owner_rw >> 6)
+    if stat.S_ISREG(snapshot.st_mode):
+        return 0o666
+    raise SafetyError("Permission repair requires a regular file or directory")
 
 
 def projected_xattrs(attributes, mode):
@@ -143,8 +145,14 @@ def projected_xattrs(attributes, mode):
 
 def copy_directory_metadata(source_fd, target_fd):
     s = os.fstat(source_fd)
+    target_stat = os.fstat(target_fd)
+    if not stat.S_ISDIR(s.st_mode) or not stat.S_ISDIR(target_stat.st_mode):
+        raise SafetyError("Directory metadata copying requires directory descriptors")
+    directory_mode = stat.S_IMODE(s.st_mode)
+    if not directory_mode & 0o111:
+        raise SafetyError("Refusing to copy a directory mode with no execute bits; enable metadata normalization to repair it")
     os.fchown(target_fd, s.st_uid, s.st_gid)
-    os.fchmod(target_fd, stat.S_IMODE(s.st_mode))
+    os.fchmod(target_fd, directory_mode)
     desired = xattrs(source_fd)
     # Remove inherited default/access ACLs or attributes absent from the original.
     for name in xattrs(target_fd):

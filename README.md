@@ -1,4 +1,4 @@
-# Unraid Cross-Disk Deduplicator — v2.2.0
+# Unraid Cross-Disk Deduplicator — v2.3.0
 
 Consolidate identical files from different **physical array disks** onto a chosen torrent file's disk. Keep the library's relative path and replace its independent copy with a same-filesystem hardlink. Default operation is **dry-run**.
 
@@ -80,6 +80,7 @@ python3 ./unraid-cross-disk-deduplicator.py --real-run \
 | `-e PATH`, `--exclude PATH` | Exclude a path or subtree; repeatable; supports quoted shell-style wildcards. |
 | `-v LEVEL`, `--verbose LEVEL` | Console/file level: DEBUG, INFO, WARNING, ERROR or CRITICAL; case-insensitive. Default INFO. |
 | `--min-size BYTES` | Minimum size to consider; positive integer; default 1. For large media only, use e.g. `--min-size 104857600` for 100 MiB. |
+| `--progress-interval SECONDS` | Log current phase, file and byte progress every N seconds; default 30. Use 10 for more frequent updates or 0 to disable periodic messages. Must be finite and non-negative. |
 | `--no-normalize-metadata` | Disable automatic Unraid ownership/permission repair and use strict metadata matching. |
 | `--allow-metadata-change` | Allow the retained source's attributes to replace remaining extended-attribute conflicts. With normalization disabled, also allow ownership/mode conflicts. |
 | `--log-dir DIRECTORY` | Directory for logs and durable JSONL journals. |
@@ -130,6 +131,12 @@ Inventory metadata is held in memory, proportional to file count; file contents 
 **Concurrency limitation:** validation cannot make a pathname removal atomic with respect to unrelated writers. Pausing all writers and Mover is a requirement. The journal supports inspection and safe revalidation; it is not an automatic rollback tool or a guarantee against abrupt hardware failure.
 
 ## Logs, journal and recovery
+
+After scanning, an immediate summary reports the file count. The next message reports candidate paths, unique inodes and the total bytes to hash. All hashing finishes before duplicate actions begin, so large inventories can spend hours in this phase even during a dry run.
+
+At INFO level, a heartbeat runs every 30 seconds by default throughout scanning, grouping, hashing, comparison and replacement. It shows the current phase and path, elapsed time, and (while reading content) bytes processed and file percentage. Hashing also shows completed hashes and completed hash bytes against their totals. The current file's bytes are reported separately from those completed totals. Comparisons show both paths and count matched bytes per file, not the combined physical reads of both files. Hashing completion has its own summary before duplicate processing starts.
+
+The heartbeat uses an independent thread that reads in-memory counters; it does not inspect media or write recovery events. If a read is waiting, messages continue and report how long the byte counter has not advanced. This proves the monitor is responsive, not that storage is making progress. OS scheduling or stalled log output can still delay messages. Paths are escaped as in other log messages. `--progress-interval 10` changes the interval; `--progress-interval 0` disables the heartbeat but retains phase summaries. WARNING/ERROR logging levels suppress these INFO messages.
 
 Action messages explicitly label `original`, `retained_source` and `replacement_hardlink`. The original may be on disk2 while both the retained source and replacement hardlink are on disk1. The replacement preserves the original's relative path on the source disk; it does not create a cross-filesystem hardlink at the original physical path.
 

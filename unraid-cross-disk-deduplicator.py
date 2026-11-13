@@ -15,6 +15,7 @@ import grp
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -23,10 +24,12 @@ import signal
 import stat
 import struct
 import sys
+import threading
+import time
 import uuid
 from collections import defaultdict
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 CHUNK = 1024 * 1024
 DISK_RE = re.compile(r"disk[1-9][0-9]*\Z")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -59,6 +62,86 @@ def content_identity(s):
 def quoted(path):
     # Escapes control characters and undecodable filename bytes in terminal logs.
     return json.dumps(os.fspath(path), ensure_ascii=True)
+
+
+def human_bytes(value):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if value < 1024 or unit == "PiB":
+            return "%.1f %s" % (value, unit)
+        value /= 1024
+
+
+class Progress:
+    """Report main-thread work, including a read that has not returned yet.
+
+    The monitor only reads in-memory counters and writes ordinary logs. It never
+    touches media descriptors or the recovery journal.
+    """
+    def __init__(self, interval=30):
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.thread = None
+        self.state = None
+
+    def start(self, phase, detail="", path=None, other=None, total_bytes=None):
+        if not self.interval:
+            return
+        now = time.monotonic()
+        with self.lock:
+            self.state = dict(phase=phase, detail=detail, path=path, other=other,
+                              total=total_bytes, done=0, started=now, advanced=now)
+
+    def advance(self, amount):
+        if not self.interval:
+            return
+        with self.lock:
+            if self.state is not None:
+                self.state["done"] += amount
+                self.state["advanced"] = time.monotonic()
+
+    def report(self):
+        with self.lock:
+            state = dict(self.state) if self.state is not None else None
+        if state is None:
+            return
+        now = time.monotonic()
+        fields = [state["phase"]]
+        if state["detail"]:
+            fields.append(state["detail"])
+        if state["path"] is not None:
+            fields.append("file=" + quoted(state["path"]))
+        if state["other"] is not None:
+            fields.append("compared_with=" + quoted(state["other"]))
+        if state["total"] is not None:
+            percent = 100 * state["done"] / state["total"] if state["total"] else 100
+            fields.append("file progress=%s/%s (%.1f%%)" % (
+                human_bytes(state["done"]), human_bytes(state["total"]), percent))
+            idle = now - state["advanced"]
+            if idle >= self.interval:
+                fields.append("no byte progress for %.0fs; read or I/O may be waiting" % idle)
+        fields.append("phase elapsed=%.0fs" % (now - state["started"]))
+        LOG.info("Progress: %s", "; ".join(fields))
+
+    def monitor(self):
+        while not self.stop.wait(self.interval):
+            self.report()
+
+    def __enter__(self):
+        self.stop.clear()
+        if self.interval:
+            self.thread = threading.Thread(target=self.monitor, name="dedup-progress", daemon=True)
+            self.thread.start()
+        return self
+
+    def close(self):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join()
+            self.thread = None
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 @dataclasses.dataclass
@@ -238,7 +321,7 @@ class PhysicalDisk:
                 os.close(fd)
 
 
-def hash_fd(fd):
+def hash_fd(fd, progress=None):
     before = os.fstat(fd)
     os.lseek(fd, 0, os.SEEK_SET)
     digest = hashlib.sha256()
@@ -247,12 +330,14 @@ def hash_fd(fd):
         if not block:
             break
         digest.update(block)
+        if progress is not None:
+            progress.advance(len(block))
     if stamp(before) != stamp(os.fstat(fd)):
         raise ChangedFile("File changed while hashing")
     return digest.hexdigest()
 
 
-def compare_fds(left, right):
+def compare_fds(left, right, progress=None):
     before = [os.fstat(fd) for fd in (left, right)]
     if before[0].st_size != before[1].st_size:
         raise ChangedFile("File sizes differ during final comparison")
@@ -264,6 +349,9 @@ def compare_fds(left, right):
             raise ChangedFile("Contents differ during final comparison")
         if not a:
             break
+        if progress is not None:
+            # Count matched bytes per file, rather than both physical reads.
+            progress.advance(len(a))
     after = [os.fstat(fd) for fd in (left, right)]
     if any(stamp(a) != stamp(b) for a, b in zip(before, after)):
         raise ChangedFile("File changed during final comparison")
@@ -353,8 +441,11 @@ class Engine:
         self.errors = 0
         self.exclusions = self.prepare_exclusions(args.exclude)
         self.inventory = []
+        self.progress = Progress(getattr(args, "progress_interval", 30))
+        self.operation_detail = ""
 
     def close(self):
+        self.progress.close()
         for disk in self.roots.values():
             disk.close()
 
@@ -393,15 +484,20 @@ class Engine:
                 LOG.info("Scanning %s", quoted(disk.path))
                 self.walk(disk, "")
         # Reject duplicate input paths; order is independent of filesystem iteration.
+        self.progress.start("Sorting scanned paths", detail="inventory files=%s" % len(self.inventory))
         unique = {(str(e.root), e.relative): e for e in self.inventory}
         self.inventory = sorted(unique.values(), key=lambda e: os.fsencode(e.path))
         self.counts["files_scanned"] = len(self.inventory)
         if self.errors:
             raise SafetyError("Scan incomplete; refusing to process a partial inventory")
+        LOG.info("Scan complete: %s files across %s disks; grouping candidates by size",
+                 len(self.inventory), len(self.roots))
 
     def walk(self, disk, relative):
         if self.excluded(disk.path / relative):
             return
+        self.progress.start("Scanning directories", path=disk.path / relative,
+                            detail="inventory files=%s" % len(self.inventory))
         # Open the directory through its anchored parent, including the disk root.
         try:
             with disk.parent(relative + "/.scan" if relative else ".scan") as (fd, _):
@@ -439,6 +535,8 @@ class Engine:
             if not record:
                 continue
             path = os.fsdecode(record)
+            self.progress.start("Scanning input list", path=path,
+                                detail="inventory files=%s" % len(self.inventory))
             try:
                 if not os.path.isabs(path) or os.path.normpath(path) != path:
                     raise SafetyError("Input paths must be absolute and normalized")
@@ -465,28 +563,47 @@ class Engine:
                 self.error("Invalid input path " + quoted(path), exc)
 
     def groups(self):
+        self.progress.start("Grouping files by size", detail="inventory files=%s" % len(self.inventory))
         by_size = defaultdict(list)
         for entry in self.inventory:
             by_size[entry.snapshot.st_size].append(entry)
         hashed = {}
         groups = []
-        for size in sorted(by_size):
+        self.progress.start("Selecting cross-disk hashing candidates")
+        sizes = [size for size in sorted(by_size)
+                 if len({str(e.root) for e in by_size[size]}) >= 2
+                 and any(e.torrent for e in by_size[size])]
+        total_inodes = total_bytes = total_paths = 0
+        for size in sizes:
+            count = len({stamp(e.snapshot) for e in by_size[size]})
+            total_inodes += count
+            total_bytes += size * count
+            total_paths += len(by_size[size])
+        LOG.info("Hashing candidates: %s paths; %s unique inodes; %s across %s size groups; "
+                 "progress interval=%ss (0 disables heartbeat)",
+                 total_paths, total_inodes, human_bytes(total_bytes), len(sizes), self.progress.interval)
+        started = time.monotonic()
+        for size in sizes:
             entries = by_size[size]
-            if len({str(e.root) for e in entries}) < 2 or not any(e.torrent for e in entries):
-                continue
             by_hash = defaultdict(list)
             for entry in entries:
                 try:
+                    detail = "completed hashes=%s/%s; completed hash bytes=%s/%s" % (
+                        self.counts["inodes_hashed"], total_inodes,
+                        human_bytes(self.counts["bytes_hashed"]), human_bytes(total_bytes))
+                    self.progress.start("Hashing SHA-256", path=entry.path,
+                                        total_bytes=size, detail=detail)
                     with self.roots[str(entry.root)].opened(entry) as (fd, _, _):
                         key = stamp(entry.snapshot)
                         if key not in hashed:
-                            hashed[key] = hash_fd(fd)
+                            hashed[key] = hash_fd(fd, progress=self.progress)
                             self.counts["inodes_hashed"] += 1
                             self.counts["bytes_hashed"] += size
                         entry.digest = hashed[key]
                     by_hash[entry.digest].append(entry)
                 except (OSError, SafetyError) as exc:
                     self.error("Hash failed for " + quoted(entry.path), exc)
+            self.progress.start("Grouping matching hashes", detail="size=%s" % human_bytes(size))
             for digest in sorted(by_hash):
                 group = by_hash[digest]
                 if len({str(e.root) for e in group}) > 1 and any(e.torrent for e in group):
@@ -494,6 +611,9 @@ class Engine:
         # Complete hashing before any mutation; an I/O error aborts the whole plan.
         if self.errors:
             raise SafetyError("Hashing incomplete; no deduplication was performed")
+        LOG.info("Hashing complete: %s inodes; %s; %.1fs; %s cross-disk duplicate groups",
+                 self.counts["inodes_hashed"], human_bytes(self.counts["bytes_hashed"]),
+                 time.monotonic() - started, len(groups))
         return groups
 
     def record(self, event, **fields):
@@ -564,6 +684,10 @@ class Engine:
                 entry.snapshot = now
 
     def run(self):
+        with self.progress:
+            return self._run()
+
+    def _run(self):
         self.inventory = []
         self.counts.clear()
         self.errors = 0
@@ -571,14 +695,23 @@ class Engine:
         self.scan()
         groups = self.groups()
         self.counts["duplicate_groups"] = len(groups)
-        for group in groups:
+        for group_number, group in enumerate(groups, 1):
+            self.progress.start("Selecting retained torrent source",
+                                detail="duplicate group=%s/%s" % (group_number, len(groups)))
             source = min((e for e in group if e.torrent), key=lambda e: os.fsencode(e.path))
             for duplicate in sorted(group, key=lambda e: os.fsencode(e.path)):
                 if duplicate.root == source.root:
                     continue
                 try:
+                    self.operation_detail = "duplicate group=%s/%s; planned=%s; completed=%s; metadata skips=%s" % (
+                        group_number, len(groups), self.counts["planned"], self.counts["completed"],
+                        self.counts["metadata_conflicts_skipped"])
+                    self.progress.start("Checking duplicate paths and share policy", path=duplicate.path,
+                                        other=source.path, detail=self.operation_detail)
                     self.deduplicate(source, duplicate)
                     if self.args.real_run:
+                        self.progress.start("Refreshing retained inode aliases", path=source.path,
+                                            detail=self.operation_detail)
                         self.refresh_source_aliases(source)
                 except (OSError, SafetyError) as exc:
                     self.error("Operation failed; original retained unless journal records its removal", exc)
@@ -602,7 +735,11 @@ class Engine:
         old_removed = False
         with source_disk.opened(source) as (source_fd, source_parent, source_name):
             with old_disk.opened(duplicate) as (old_fd, old_parent, old_name):
-                source_before, old_before = compare_fds(source_fd, old_fd)
+                self.progress.start("Comparing duplicate contents", path=duplicate.path, other=source.path,
+                                    total_bytes=duplicate.snapshot.st_size, detail=self.operation_detail)
+                source_before, old_before = compare_fds(source_fd, old_fd, progress=self.progress)
+                self.progress.start("Checking metadata and permissions", path=duplicate.path,
+                                    other=source.path, detail=self.operation_detail)
                 if stamp(source_before) != stamp(source.snapshot) or stamp(old_before) != stamp(duplicate.snapshot):
                     raise ChangedFile("File changed after opening and before final comparison")
                 # Detect collisions before making permission changes to any participant.
@@ -643,6 +780,8 @@ class Engine:
                              quoted(duplicate.path), quoted(source.path),
                              quoted(target), quoted(duplicate.path))
                     return
+                self.progress.start("Creating and syncing replacement hardlink", path=target,
+                                    detail=self.operation_detail)
                 with source_disk.parent(duplicate.relative, create=True, template=old_disk) as (target_parent, target_name):
                     try:
                         try:
@@ -664,10 +803,15 @@ class Engine:
                         os.fsync(source_fd)
                         os.fsync(target_parent)
                         self.record("LINK_READY", **fields)
-                        source_now, old_now = compare_fds(source_fd, old_fd)
+                        self.progress.start("Verifying replacement contents", path=duplicate.path,
+                                            other=source.path, total_bytes=duplicate.snapshot.st_size,
+                                            detail=self.operation_detail)
+                        source_now, old_now = compare_fds(source_fd, old_fd, progress=self.progress)
                         if content_identity(source_now) != content_identity(source_before) or stamp(old_now) != stamp(old_before):
                             raise ChangedFile("File changed during replacement creation")
                         self.record("VERIFIED", **fields)
+                        self.progress.start("Verifying paths before original removal", path=duplicate.path,
+                                            detail=self.operation_detail)
                         source_disk.check()
                         old_disk.check()
                         # Ensure the pinned parent directories still have their expected paths.
@@ -690,6 +834,8 @@ class Engine:
                         # Lasting replacement is verified and its directory entry synced.
                         # Set the conservative flag BEFORE unlink so an asynchronous
                         # signal can never trigger rollback after a successful unlink.
+                        self.progress.start("Removing verified original and syncing directory", path=duplicate.path,
+                                            detail=self.operation_detail)
                         old_removed = True
                         os.unlink(old_name, dir_fd=old_parent)
                         os.fsync(old_parent)
@@ -755,6 +901,8 @@ def arguments(argv=None):
     parser.add_argument("-e", "--exclude", action="append", default=[], metavar="PATH", help="exclude a path/subtree; repeatable; quote wildcards")
     parser.add_argument("-v", "--verbose", type=str.upper, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"), default="INFO")
     parser.add_argument("--min-size", type=int, default=1, metavar="BYTES", help="minimum file size (default: 1; empty files save no data)")
+    parser.add_argument("--progress-interval", type=float, default=30, metavar="SECONDS",
+                        help="log current phase/file and byte progress every N seconds (default: 30; 0 disables)")
     parser.add_argument("--no-normalize-metadata", dest="normalize_metadata", action="store_false", default=True,
                         help="disable nobody:users ownership and Unraid permission repair")
     parser.add_argument("--allow-metadata-change", action="store_true",
@@ -768,6 +916,8 @@ def arguments(argv=None):
         parser.error("--null requires --process-file")
     if args.min_size < 1 or args.keep_logs < 1:
         parser.error("--min-size and --keep-logs must be positive")
+    if not math.isfinite(args.progress_interval) or args.progress_interval < 0:
+        parser.error("--progress-interval must be a finite non-negative number")
     return args
 
 

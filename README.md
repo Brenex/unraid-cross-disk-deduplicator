@@ -1,4 +1,4 @@
-# Unraid Cross-Disk Deduplicator — v2.3.0
+# Unraid Cross-Disk Deduplicator — v2.3.1
 
 Consolidate identical files from different **physical array disks** onto a chosen torrent file's disk. Keep the library's relative path and replace its independent copy with a same-filesystem hardlink. Default operation is **dry-run**.
 
@@ -20,7 +20,7 @@ Torrent: /mnt/disk1/data/torrents/Release/original.mkv
 Library: /mnt/disk1/data/media/Movies/Title/renamed.mkv
 ```
 
-The two remaining files share one inode. The second disk's library entry is removed only after the replacement is created, synced, compared byte-for-byte, and verified. The logical library path remains `/mnt/user/data/media/Movies/Title/renamed.mkv`, provided the destination disk participates in that user share. Consumers using `/mnt/disk2/...` directly must have their paths updated separately.
+The two remaining paths share one inode. The torrent source and old media copy are compared byte-for-byte once, before creating the replacement hardlink. The second disk's library entry is removed only after the replacement is created and synced, its inode/path identity is checked, and file metadata is rechecked for changes. No second content comparison is performed. The logical library path remains `/mnt/user/data/media/Movies/Title/renamed.mkv`, provided the destination disk participates in that user share. Consumers using `/mnt/disk2/...` directly must have their paths updated separately.
 
 This does not create hardlinks across filesystems. It creates the library hardlink on the torrent file's physical filesystem.
 
@@ -108,7 +108,7 @@ Do not edit the NUL-delimited file with a line-oriented text editor. LF lists pr
 4. Group matching content and choose a source deterministically: the bytewise lexicographically first path with a directory component named `torrent` or `torrents`, case-insensitive. This matches whole directory components, not substrings such as `my-torrent-backups`.
 5. Process only copies on other disks. Same-disk duplicates and groups without a torrent-priority source are left alone. Other torrent copies on different disks may also be consolidated.
 
-Inventory metadata is held in memory, proportional to file count; file contents are streamed. Hashing and comparisons run sequentially to avoid simultaneous random reads across the array. Each candidate is compared before replacement and again after the hardlink is ready, so real runs perform additional reads beyond hashing.
+Inventory metadata is held in memory, proportional to file count; file contents are streamed. Hashing and comparisons run sequentially to avoid simultaneous random reads across the array. After initial hashing, each candidate receives one full byte-for-byte comparison before replacement. Once the hardlink is ready, only inode/path identity and file metadata are checked; neither file's contents are read again. This removes the second full comparison from earlier versions while retaining change detection through recorded metadata. All writers and Mover must remain paused.
 
 ## Safety and metadata behavior
 
@@ -154,7 +154,7 @@ Each invocation that passes disk validation creates:
 | `METADATA_NORMALIZED` | Ownership/mode repair applied, verified and synced. |
 | `PREPARED` | Candidate compared; intent persisted before destination creation. |
 | `LINK_READY` | Replacement link exists and was synced. |
-| `VERIFIED` | Replacement/source and original compared successfully; removal may follow. |
+| `VERIFIED` | File metadata rechecked after linking; `verification="inode-and-metadata"` in v2.3.1. Content comparison already occurred before linking; final path/inode checks still precede removal. Earlier versions also repeated the content comparison here. |
 | `ORIGINAL_REMOVED` | Original directory entry removed and its parent synced. |
 | `LINK_ROLLED_BACK` | Script removed its newly created link before original removal. |
 | `RUN_COMPLETE` | Invocation finished; includes summary counters. |
@@ -184,6 +184,6 @@ The script does not configure torrent clients, Radarr, Sonarr, container mapping
 
 ## Validation performed
 
-The updated suite ran 70 regression tests, with 69 passing and one live POSIX ACL test skipped because the test filesystem lacks ACL support. Disposable tests used two actual Linux filesystems (`/tmp` and `/dev/shm`) for renamed duplicates, unusual and undecodable filenames, exclusions, NUL input, collisions, symlinks, hardlink identity, metadata handling, multiple aliases, stale/changing files, injected link/unlink/journal failures and interruption windows. The Python entry point was checked with `--help` and `--version`. Added checks cover explicit file/directory mode policy, default repair, dry-run preservation, torrent source priority, directory traversal during interrupted repair, rejection of invalid directory metadata templates, inode snapshot refresh, account resolution, repair failures and ACL preview. Real ownership changes to UID 99/GID 100 require an Unraid host and were not executed here. Tests inject the test account IDs for filesystem operations and verify the Unraid account lookup separately.
+The updated suite ran 82 regression tests, with 81 passing and one live POSIX ACL test skipped because the test filesystem lacks ACL support. Disposable tests used two actual Linux filesystems (`/tmp` and `/dev/shm`) for renamed duplicates, unusual and undecodable filenames, exclusions, NUL input, collisions, symlinks, hardlink identity, metadata handling, multiple aliases, stale/changing files, injected link/unlink/journal failures and interruption windows. The Python entry point was checked with `--help` and `--version`. Added checks cover explicit file/directory mode policy, default repair, dry-run preservation, torrent source priority, directory traversal during interrupted repair, rejection of invalid directory metadata templates, inode snapshot refresh, account resolution, repair failures and ACL preview. Progress checks cover a waiting read, byte counters, escaped paths, configurable intervals, and monitor cleanup. Replacement checks confirm exactly one comparison per duplicate, no content reads after `LINK_READY`, preservation of changed originals, and rejection of a substituted replacement inode. Real ownership changes to UID 99/GID 100 require an Unraid host and were not executed here. Tests inject the test account IDs for filesystem operations and verify the Unraid account lookup separately.
 
 These are Linux filesystem regression tests, not a live Unraid/XFS/Btrfs/ZFS integration test. Review a dry-run on your server before applying changes.

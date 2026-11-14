@@ -29,7 +29,7 @@ import time
 import uuid
 from collections import defaultdict
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 CHUNK = 1024 * 1024
 DISK_RE = re.compile(r"disk[1-9][0-9]*\Z")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -803,13 +803,16 @@ class Engine:
                         os.fsync(source_fd)
                         os.fsync(target_parent)
                         self.record("LINK_READY", **fields)
-                        self.progress.start("Verifying replacement contents", path=duplicate.path,
-                                            other=source.path, total_bytes=duplicate.snapshot.st_size,
+                        self.progress.start("Checking replacement inode and file metadata", path=target,
                                             detail=self.operation_detail)
-                        source_now, old_now = compare_fds(source_fd, old_fd, progress=self.progress)
+                        # Contents were compared before linking. A hardlink shares
+                        # the source inode; verify identity below without rereading
+                        # either file. Link creation legitimately changes the
+                        # source's ctime/nlink, but must not change its content stamp.
+                        source_now, old_now = os.fstat(source_fd), os.fstat(old_fd)
                         if content_identity(source_now) != content_identity(source_before) or stamp(old_now) != stamp(old_before):
                             raise ChangedFile("File changed during replacement creation")
-                        self.record("VERIFIED", **fields)
+                        self.record("VERIFIED", verification="inode-and-metadata", **fields)
                         self.progress.start("Verifying paths before original removal", path=duplicate.path,
                                             detail=self.operation_detail)
                         source_disk.check()

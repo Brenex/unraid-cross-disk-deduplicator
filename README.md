@@ -244,15 +244,3 @@ This version handles **array disks only**. Cache/pool copies are outside the inv
 Files accessed through physical `/mnt/diskN` paths will move to a different physical path. User-share visibility depends on Unraid share settings. Mover, filesystem conversions and tools that copy/recreate files may change hardlink relationships later; verify them after storage changes.
 
 The script does not configure torrent clients, Radarr, Sonarr, container mappings, or Mover. Run it on the Unraid host with appropriate access. A host command is used here because disk-root and mount validation must see the host's physical filesystems.
-
-## Validation performed
-
-Run the regression suite from the repository root:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-The updated suite ran 112 regression tests, with 111 passing and one live POSIX ACL test skipped because the test filesystem lacks ACL support. Disposable tests used two actual Linux filesystems (`/tmp` and `/dev/shm`) for renamed duplicates, unusual and undecodable filenames, exclusions, NUL input, collisions, symlinks, hardlink identity, metadata handling, multiple aliases, stale/changing files, injected link/unlink/journal failures and interruption windows. The Python entry point was checked with `--help` and `--version`. Added checks cover explicit file/directory mode policy, default repair, dry-run preservation, torrent source priority, directory traversal during interrupted repair, rejection of invalid directory metadata templates, inode snapshot refresh, account resolution, repair failures and ACL preview. Progress checks cover a waiting read, byte counters, escaped paths, configurable intervals, and monitor cleanup. Replacement checks confirm exactly one comparison per duplicate, no content reads after `LINK_READY`, preservation of changed originals, and rejection of a substituted replacement inode. Directory and selection checks cover logical-to-physical expansion, recursive scope boundaries, overlapping scopes, exclusions, missing and symlinked scopes, physical-directory inputs, general mode without torrent names, same-path duplicates, free bytes versus percentages, fixed startup snapshots, deterministic ties, fullest-first processing, custom masters outside the input tree, unmatched torrent groups, and preserved legacy commands. Real ownership changes to UID 99/GID 100 require an Unraid host and were not executed here. Tests inject the test account IDs for filesystem operations and verify the Unraid account lookup separately.
-
-These are Linux filesystem regression tests, not a live Unraid/XFS/Btrfs/ZFS integration test. Review a dry-run on your server before applying changes.

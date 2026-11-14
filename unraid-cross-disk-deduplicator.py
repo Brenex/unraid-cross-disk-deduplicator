@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Consolidate identical files onto a torrent source's physical Unraid disk.
+"""Consolidate identical files across physical Unraid array disks.
+
+General mode retains existing copies by available disk space. Torrent mode
+retains a configurable master copy. User-share directories are expanded to
+physical disk paths; file content is never read or written through /mnt/user.
 
 All filesystem operations use pinned directory descriptors and reject symlinks.
 Writers and Mover MUST be paused: a cooperative lock cannot stop other programs.
@@ -29,7 +33,7 @@ import time
 import uuid
 from collections import defaultdict
 
-VERSION = "2.3.1"
+VERSION = "3.0.0"
 CHUNK = 1024 * 1024
 DISK_RE = re.compile(r"disk[1-9][0-9]*\Z")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -163,6 +167,36 @@ class Entry:
     @property
     def share(self):
         return PurePosixPath(self.relative).parts[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class DirectoryScope:
+    display: str
+    relative: str
+    root: object = None
+
+    def matches(self, entry):
+        return (self.root is None or self.root == str(entry.root)) and (
+            entry.relative == self.relative or entry.relative.startswith(self.relative + "/"))
+
+
+def directory_scope(raw, roots):
+    """Map a logical share path across disks or pin an explicit physical path."""
+    value = os.fspath(raw).rstrip("/")
+    if not os.path.isabs(value) or os.path.normpath(value) != value or ".." in value.split("/"):
+        raise SafetyError("Directory paths must be absolute and normalized: " + quoted(raw))
+    prefix = "/mnt/user/"
+    if value.startswith(prefix):
+        relative = value[len(prefix):]
+        parts_of(relative)
+        return DirectoryScope(value, relative)
+    for root in roots:
+        prefix = str(root) + "/"
+        if value.startswith(prefix):
+            relative = value[len(prefix):]
+            parts_of(relative)
+            return DirectoryScope(value, relative, str(root))
+    raise SafetyError("Directory must be under /mnt/user/ or a selected physical disk: " + quoted(raw))
 
 
 def parts_of(relative):
@@ -431,18 +465,26 @@ class Journal:
 
 class Engine:
     def __init__(self, args, roots, journal=None, policy=None, owner=None):
+        roots = list(roots)
         self.args = args
         self.normalization_owner = (owner if owner is not None else unraid_owner()) if args.normalize_metadata else None
         self.metadata_seen = set()
+        self.mode = getattr(args, "mode", "torrent")
+        self.directory_scopes = [directory_scope(path, roots)
+                                 for path in getattr(args, "directories", [])]
+        self.master_scopes = [directory_scope(path, roots)
+                              for path in getattr(args, "master_dirs", [])]
+        self.exclusions = self.prepare_exclusions(args.exclude)
         self.roots = {str(root): PhysicalDisk(root) for root in roots}
         self.journal = journal
         self.policy = policy if policy is not None else SharePolicy()
         self.counts = defaultdict(int)
         self.errors = 0
-        self.exclusions = self.prepare_exclusions(args.exclude)
         self.inventory = []
         self.progress = Progress(getattr(args, "progress_interval", 30))
         self.operation_detail = ""
+        self.legacy_torrent = self.mode == "torrent" and not self.directory_scopes and not self.master_scopes
+        self.disk_usage = {}
 
     def close(self):
         self.progress.close()
@@ -476,9 +518,88 @@ class Engine:
         self.errors += 1
         LOG.error("%s: %s", message, ascii(str(exc)))
 
+    def snapshot_disk_usage(self):
+        """Rank by an initial snapshot, not by progressively changing free space."""
+        self.disk_usage = {}
+        for key, disk in self.roots.items():
+            disk.check()
+            usage = os.fstatvfs(disk.fd)
+            total = usage.f_blocks * usage.f_frsize
+            available = usage.f_bavail * usage.f_frsize
+            used = (usage.f_blocks - usage.f_bfree) * usage.f_frsize
+            self.disk_usage[key] = dict(total_bytes=total, used_bytes=used, available_bytes=available)
+            LOG.info("Disk usage snapshot: %s; total=%s; used=%s; available=%s (%.1f%%)",
+                     quoted(disk.path), human_bytes(total), human_bytes(used), human_bytes(available),
+                     100 * available / total if total else 0)
+        self.record("DISK_USAGE_SNAPSHOT", dedup_mode=self.mode, selection_metric="available-bytes",
+                    disks=[dict(path=key, **value) for key, value in self.disk_usage.items()])
+
+    def is_target(self, entry):
+        return not self.directory_scopes or any(scope.matches(entry) for scope in self.directory_scopes)
+
+    def is_master(self, entry):
+        if self.master_scopes:
+            return any(scope.matches(entry) for scope in self.master_scopes)
+        return entry.torrent
+
+    def eligible_group(self, entries):
+        return (len({str(e.root) for e in entries}) > 1
+                and any(self.is_target(e) for e in entries)
+                and (self.mode == "general" or any(self.is_master(e) for e in entries)))
+
+    def source_key(self, entry):
+        available = self.disk_usage[str(entry.root)]["available_bytes"]
+        return (-available, int(entry.root.name[4:]), os.fsencode(entry.path))
+
+    def choose_source(self, group):
+        candidates = [entry for entry in group if self.mode == "general" or self.is_master(entry)]
+        # Preserve the source selection of commands used before scoped modes.
+        if self.legacy_torrent:
+            return min(candidates, key=lambda e: os.fsencode(e.path))
+        return min(candidates, key=self.source_key)
+
+    def scan_scoped_directories(self):
+        # Masters outside the target tree are reference candidates, never
+        # removal targets. Existing source permission normalization still applies.
+        scopes = self.directory_scopes + (self.master_scopes if self.mode == "torrent" else [])
+        found = set()
+        for disk in self.roots.values():
+            relatives = []
+            for scope in scopes:
+                if scope.root is not None and scope.root != str(disk.path):
+                    continue
+                try:
+                    with disk.parent(scope.relative + "/.scope"):
+                        pass
+                except FileNotFoundError:
+                    continue
+                except (OSError, SafetyError) as exc:
+                    self.error("Cannot scan scoped directory " + quoted(disk.path / scope.relative), exc)
+                    continue
+                found.add(scope)
+                relatives.append(scope.relative)
+            # Collapse overlapping roots so nested scopes are not walked twice.
+            selected = []
+            if not self.directory_scopes:
+                LOG.info("Scanning %s", quoted(disk.path))
+                self.walk(disk, "")
+                continue
+            for relative in sorted(set(relatives), key=lambda r: (len(r.split("/")), os.fsencode(r))):
+                if any(relative == parent or relative.startswith(parent + "/") for parent in selected):
+                    continue
+                selected.append(relative)
+                LOG.info("Scanning %s", quoted(disk.path / relative))
+                self.walk(disk, relative)
+        for scope in scopes:
+            if scope not in found:
+                self.error("Directory absent from selected array disks " + quoted(scope.display),
+                           SafetyError("No physical directory found; pools/cache are outside this tool's scope"))
+
     def scan(self):
         if self.args.process_file:
             self.scan_list()
+        elif self.directory_scopes or self.master_scopes:
+            self.scan_scoped_directories()
         else:
             for disk in self.roots.values():
                 LOG.info("Scanning %s", quoted(disk.path))
@@ -550,6 +671,10 @@ class Engine:
                         relative = path[len(prefix):]
                         if "/" not in relative:
                             raise SafetyError("Input file is outside a user-share directory")
+                        probe = Entry(disk.path, relative, None)
+                        if self.directory_scopes and not (self.is_target(probe) or (
+                                self.mode == "torrent" and self.is_master(probe))):
+                            raise SafetyError("Input file is outside configured input/master directories")
                         with disk.parent(relative) as (fd, name):
                             s = os.stat(name, dir_fd=fd, follow_symlinks=False)
                         if not stat.S_ISREG(s.st_mode) or s.st_dev != disk.snapshot.st_dev:
@@ -570,9 +695,7 @@ class Engine:
         hashed = {}
         groups = []
         self.progress.start("Selecting cross-disk hashing candidates")
-        sizes = [size for size in sorted(by_size)
-                 if len({str(e.root) for e in by_size[size]}) >= 2
-                 and any(e.torrent for e in by_size[size])]
+        sizes = [size for size in sorted(by_size) if self.eligible_group(by_size[size])]
         total_inodes = total_bytes = total_paths = 0
         for size in sizes:
             count = len({stamp(e.snapshot) for e in by_size[size]})
@@ -606,7 +729,7 @@ class Engine:
             self.progress.start("Grouping matching hashes", detail="size=%s" % human_bytes(size))
             for digest in sorted(by_hash):
                 group = by_hash[digest]
-                if len({str(e.root) for e in group}) > 1 and any(e.torrent for e in group):
+                if self.eligible_group(group):
                     groups.append(group)
         # Complete hashing before any mutation; an I/O error aborts the whole plan.
         if self.errors:
@@ -678,7 +801,7 @@ class Engine:
         with disk.parent(source.relative) as (fd, name):
             now = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if content_identity(now) != content_identity(source.snapshot):
-            raise ChangedFile("Torrent source changed after an operation")
+            raise ChangedFile("Retained source changed after an operation")
         for entry in self.inventory:
             if identity(entry.snapshot) == identity(source.snapshot):
                 entry.snapshot = now
@@ -692,15 +815,23 @@ class Engine:
         self.counts.clear()
         self.errors = 0
         self.metadata_seen.clear()
+        self.progress.start("Reading initial disk usage")
+        self.snapshot_disk_usage()
         self.scan()
         groups = self.groups()
         self.counts["duplicate_groups"] = len(groups)
         for group_number, group in enumerate(groups, 1):
-            self.progress.start("Selecting retained torrent source",
+            self.progress.start("Selecting retained source",
                                 detail="duplicate group=%s/%s" % (group_number, len(groups)))
-            source = min((e for e in group if e.torrent), key=lambda e: os.fsencode(e.path))
-            for duplicate in sorted(group, key=lambda e: os.fsencode(e.path)):
-                if duplicate.root == source.root:
+            source = self.choose_source(group)
+            LOG.info("Retained source: %s; policy=%s; initial available=%s",
+                     quoted(source.path), "legacy torrent priority" if self.legacy_torrent else (
+                         "master directory, then most available bytes" if self.mode == "torrent"
+                         else "most available bytes among existing copies"),
+                     human_bytes(self.disk_usage[str(source.root)]["available_bytes"]))
+            for duplicate in sorted(group, key=lambda e: (
+                    self.disk_usage[str(e.root)]["available_bytes"], os.fsencode(e.path))):
+                if duplicate.root == source.root or not self.is_target(duplicate):
                     continue
                 try:
                     self.operation_detail = "duplicate group=%s/%s; planned=%s; completed=%s; metadata skips=%s" % (
@@ -725,9 +856,14 @@ class Engine:
         old_disk.check()
         self.policy.check(duplicate.share, source.root.name)
         target = source.root / duplicate.relative
+        if self.excluded(target):
+            raise SafetyError("Replacement path is excluded: " + quoted(target))
         operation = uuid.uuid4().hex
         fields = dict(operation=operation, source=str(source.path), original=str(duplicate.path),
                       target=str(target), sha256=source.digest,
+                      dedup_mode=self.mode,
+                      source_initial_available_bytes=self.disk_usage.get(str(source.root), {}).get("available_bytes"),
+                      original_initial_available_bytes=self.disk_usage.get(str(duplicate.root), {}).get("available_bytes"),
                       source_inode=list(identity(source.snapshot)),
                       original_inode=list(identity(duplicate.snapshot)))
         created = False
@@ -899,6 +1035,12 @@ def arguments(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("-r", "--real-run", action="store_true", help="apply verified deduplication")
     mode.add_argument("-d", "--dry-run", action="store_true", help="preview only (default)")
+    parser.add_argument("--mode", choices=("general", "torrent"),
+                        help="general: all content duplicates; torrent: require a master copy (default: general with a directory, legacy torrent otherwise)")
+    parser.add_argument("--directory", "--source-dir", dest="directories", action="append", default=[], metavar="PATH",
+                        help="recursively scan a /mnt/user/share directory across array disks; repeatable; explicit physical directories are also supported")
+    parser.add_argument("--master-dir", dest="master_dirs", action="append", default=[], metavar="PATH",
+                        help="torrent master directory, scanned in addition to input directories; repeatable; implies torrent mode unless --mode is specified")
     parser.add_argument("-p", "--process-file", help="absolute disk paths, one per LF-delimited line")
     parser.add_argument("-0", "--null", action="store_true", help="input list is NUL-delimited (requires -p)")
     parser.add_argument("-e", "--exclude", action="append", default=[], metavar="PATH", help="exclude a path/subtree; repeatable; quote wildcards")
@@ -909,12 +1051,21 @@ def arguments(argv=None):
     parser.add_argument("--no-normalize-metadata", dest="normalize_metadata", action="store_false", default=True,
                         help="disable nobody:users ownership and Unraid permission repair")
     parser.add_argument("--allow-metadata-change", action="store_true",
-                        help="allow retained torrent metadata to replace remaining metadata/xattr conflicts")
+                        help="allow retained source metadata to replace remaining metadata/xattr conflicts")
     parser.add_argument("--log-dir", default=str(Path(__file__).parent.resolve() / "logs"))
     parser.add_argument("--keep-logs", type=int, default=7, help="retain this many .log files; journals are never pruned")
     parser.add_argument("--version", action="version", version=VERSION)
-    parser.add_argument("disks", nargs="*", help="physical /mnt/diskN mount roots (default: all mounted array disks)")
-    args = parser.parse_args(argv)
+    parser.add_argument("disks", nargs="*", metavar="PATH", help="physical /mnt/diskN mount roots, or /mnt/user/share input directories (default: all mounted array disks)")
+    args = parser.parse_intermixed_args(argv)
+    logical_inputs = [path for path in args.disks if path.startswith("/mnt/user/")]
+    args.directories.extend(logical_inputs)
+    args.disks = [path for path in args.disks if path not in logical_inputs]
+    if args.mode is None:
+        args.mode = "torrent" if args.master_dirs or not args.directories else "general"
+    if args.master_dirs and args.mode != "torrent":
+        parser.error("--master-dir requires torrent mode")
+    if args.process_file and (args.directories or args.master_dirs):
+        parser.error("--process-file cannot be combined with --directory or --master-dir; it defines the exact inventory")
     if args.null and not args.process_file:
         parser.error("--null requires --process-file")
     if args.min_size < 1 or args.keep_logs < 1:
@@ -1007,14 +1158,18 @@ def main(argv=None):
             raise SafetyError("Real runs require root privileges")
         roots = validate_roots(args.disks)
         journal = setup_logging(args)
-        LOG.info("Version %s; mode=%s; physical disks=%s", VERSION,
-                 "REAL" if args.real_run else "DRY RUN", ", ".join(map(str, roots)))
+        LOG.info("Version %s; mode=%s; dedup_mode=%s; physical disks=%s", VERSION,
+                 "REAL" if args.real_run else "DRY RUN", args.mode, ", ".join(map(str, roots)))
+        for directory in args.directories:
+            LOG.info("Input directory: %s (mapped to physical array paths)", quoted(directory))
+        for directory in args.master_dirs:
+            LOG.info("Torrent master directory: %s", quoted(directory))
         if args.real_run:
             LOG.warning("Writers and Mover must already be paused; the lock only coordinates this script")
         with run_lock(args.real_run):
             engine = Engine(args, roots, journal=journal)
             counts = engine.run()
-            journal.write("RUN_COMPLETE", real_run=args.real_run, counts=counts)
+            journal.write("RUN_COMPLETE", real_run=args.real_run, dedup_mode=args.mode, counts=counts)
             LOG.info("Summary: %s", json.dumps(counts, sort_keys=True))
         return 0
     except KeyboardInterrupt:

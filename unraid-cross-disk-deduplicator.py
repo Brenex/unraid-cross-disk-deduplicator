@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Consolidate identical files across physical Unraid array disks.
+"""Consolidate identical files within and across physical Unraid array disks.
 
-General mode retains existing copies by available disk space. Torrent mode
-retains a configurable master copy. User-share directories are expanded to
-physical disk paths; file content is never read or written through /mnt/user.
-Use --include-same-disk to also replace independent copies within a disk.
+A master directory, when supplied, provides the retained source. Otherwise keep
+an existing copy on the disk with the most available bytes. User-share inputs
+are expanded to physical paths; file content is never accessed via /mnt/user.
+Runs preview changes unless --real-run is explicitly supplied.
 
 All filesystem operations use pinned directory descriptors and reject symlinks.
 Writers and Mover MUST be paused: a cooperative lock cannot stop other programs.
@@ -34,7 +34,7 @@ import time
 import uuid
 from collections import defaultdict
 
-VERSION = "3.1.0"
+VERSION = "4.0.0"
 CHUNK = 1024 * 1024
 DISK_RE = re.compile(r"disk[1-9][0-9]*\Z")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -159,11 +159,6 @@ class Entry:
     @property
     def path(self):
         return self.root / self.relative
-
-    @property
-    def torrent(self):
-        return any(p.lower() in ("torrent", "torrents")
-                   for p in PurePosixPath(self.relative).parts[:-1])
 
     @property
     def share(self):
@@ -470,7 +465,6 @@ class Engine:
         self.args = args
         self.normalization_owner = (owner if owner is not None else unraid_owner()) if args.normalize_metadata else None
         self.metadata_seen = set()
-        self.mode = getattr(args, "mode", "torrent")
         self.directory_scopes = [directory_scope(path, roots)
                                  for path in getattr(args, "directories", [])]
         self.master_scopes = [directory_scope(path, roots)
@@ -484,9 +478,8 @@ class Engine:
         self.inventory = []
         self.progress = Progress(getattr(args, "progress_interval", 30))
         self.operation_detail = ""
-        self.legacy_torrent = self.mode == "torrent" and not self.directory_scopes and not self.master_scopes
+        self.selection_policy = "master-directory" if self.master_scopes else "most-available-bytes"
         self.disk_usage = {}
-        self.include_same_disk = getattr(args, "include_same_disk", False)
 
     def close(self):
         self.progress.close()
@@ -533,7 +526,7 @@ class Engine:
             LOG.info("Disk usage snapshot: %s; total=%s; used=%s; available=%s (%.1f%%)",
                      quoted(disk.path), human_bytes(total), human_bytes(used), human_bytes(available),
                      100 * available / total if total else 0)
-        self.record("DISK_USAGE_SNAPSHOT", dedup_mode=self.mode, include_same_disk=self.include_same_disk,
+        self.record("DISK_USAGE_SNAPSHOT", source_selection=self.selection_policy,
                     selection_metric="available-bytes",
                     disks=[dict(path=key, **value) for key, value in self.disk_usage.items()])
 
@@ -541,32 +534,25 @@ class Engine:
         return not self.directory_scopes or any(scope.matches(entry) for scope in self.directory_scopes)
 
     def is_master(self, entry):
-        if self.master_scopes:
-            return any(scope.matches(entry) for scope in self.master_scopes)
-        return entry.torrent
+        return any(scope.matches(entry) for scope in self.master_scopes)
 
     def eligible_group(self, entries):
-        placement_ok = (len({identity(e.snapshot) for e in entries}) > 1 if self.include_same_disk
-                        else len({str(e.root) for e in entries}) > 1)
-        return (placement_ok
+        return (len({identity(e.snapshot) for e in entries}) > 1
                 and any(self.is_target(e) for e in entries)
-                and (self.mode == "general" or any(self.is_master(e) for e in entries)))
+                and (not self.master_scopes or any(self.is_master(e) for e in entries)))
 
     def source_key(self, entry):
         available = self.disk_usage[str(entry.root)]["available_bytes"]
         return (-available, int(entry.root.name[4:]), os.fsencode(entry.path))
 
     def choose_source(self, group):
-        candidates = [entry for entry in group if self.mode == "general" or self.is_master(entry)]
-        # Preserve the source selection of commands used before scoped modes.
-        if self.legacy_torrent:
-            return min(candidates, key=lambda e: os.fsencode(e.path))
+        candidates = [entry for entry in group if self.is_master(entry)] if self.master_scopes else group
         return min(candidates, key=self.source_key)
 
     def scan_scoped_directories(self):
         # Masters outside the target tree are reference candidates, never
         # removal targets. Existing source permission normalization still applies.
-        scopes = self.directory_scopes + (self.master_scopes if self.mode == "torrent" else [])
+        scopes = self.directory_scopes + self.master_scopes
         found = set()
         for disk in self.roots.values():
             relatives = []
@@ -676,10 +662,6 @@ class Engine:
                         relative = path[len(prefix):]
                         if "/" not in relative:
                             raise SafetyError("Input file is outside a user-share directory")
-                        probe = Entry(disk.path, relative, None)
-                        if self.directory_scopes and not (self.is_target(probe) or (
-                                self.mode == "torrent" and self.is_master(probe))):
-                            raise SafetyError("Input file is outside configured input/master directories")
                         with disk.parent(relative) as (fd, name):
                             s = os.stat(name, dir_fd=fd, follow_symlinks=False)
                         if not stat.S_ISREG(s.st_mode) or s.st_dev != disk.snapshot.st_dev:
@@ -700,16 +682,6 @@ class Engine:
         hashed = {}
         groups = []
         self.progress.start("Selecting hashing candidates")
-        if not self.include_same_disk:
-            skipped = sum(1 for entries in by_size.values()
-                          if len({str(e.root) for e in entries}) == 1
-                          and len({identity(e.snapshot) for e in entries}) > 1
-                          and any(self.is_target(e) for e in entries)
-                          and (self.mode == "general" or any(self.is_master(e) for e in entries)))
-            self.counts["same_disk_size_groups_skipped"] = skipped
-            if skipped:
-                LOG.info("Cross-disk-only mode: %s same-disk-only size groups not hashed; "
-                         "use --include-same-disk to inspect/consolidate them", skipped)
         sizes = [size for size in sorted(by_size) if self.eligible_group(by_size[size])]
         total_inodes = total_bytes = total_paths = 0
         for size in sizes:
@@ -749,10 +721,9 @@ class Engine:
         # Complete hashing before any mutation; an I/O error aborts the whole plan.
         if self.errors:
             raise SafetyError("Hashing incomplete; no deduplication was performed")
-        LOG.info("Hashing complete: %s inodes; %s; %.1fs; %s duplicate groups (%s)",
+        LOG.info("Hashing complete: %s inodes; %s; %.1fs; %s duplicate groups",
                  self.counts["inodes_hashed"], human_bytes(self.counts["bytes_hashed"]),
-                 time.monotonic() - started, len(groups),
-                 "same- and cross-disk" if self.include_same_disk else "cross-disk")
+                 time.monotonic() - started, len(groups))
         return groups
 
     def record(self, event, **fields):
@@ -841,21 +812,16 @@ class Engine:
                                 detail="duplicate group=%s/%s" % (group_number, len(groups)))
             source = self.choose_source(group)
             LOG.info("Retained source: %s; policy=%s; initial available=%s",
-                     quoted(source.path), "legacy torrent priority" if self.legacy_torrent else (
-                         "master directory, then most available bytes" if self.mode == "torrent"
-                         else "most available bytes among existing copies"),
+                     quoted(source.path), self.selection_policy,
                      human_bytes(self.disk_usage[str(source.root)]["available_bytes"]))
             for duplicate in sorted(group, key=lambda e: (
-                    0 if self.include_same_disk and e.root == source.root else 1,
+                    0 if e.root == source.root else 1,
                     self.disk_usage[str(e.root)]["available_bytes"], os.fsencode(e.path))):
                 if not self.is_target(duplicate):
                     continue
                 if identity(duplicate.snapshot) == identity(source.snapshot):
                     if duplicate.path != source.path:
                         self.counts["already_hardlinked_skipped"] += 1
-                    continue
-                if duplicate.root == source.root and not self.include_same_disk:
-                    self.counts["same_disk_copies_skipped"] += 1
                     continue
                 try:
                     self.operation_detail = "duplicate group=%s/%s; planned=%s; completed=%s; metadata skips=%s" % (
@@ -876,8 +842,6 @@ class Engine:
 
     def deduplicate(self, source, duplicate):
         same_disk = source.root == duplicate.root
-        if same_disk and not self.include_same_disk:
-            raise SafetyError("Same-disk replacement requires --include-same-disk")
         if identity(source.snapshot) == identity(duplicate.snapshot):
             return
         source_disk, old_disk = self.roots[str(source.root)], self.roots[str(duplicate.root)]
@@ -893,7 +857,7 @@ class Engine:
                       target=str(target), sha256=source.digest,
                       replacement_method="atomic-rename" if same_disk else "link-then-unlink",
                       temporary_link=str(duplicate.path.parent / temporary_name) if same_disk else None,
-                      dedup_mode=self.mode,
+                      source_selection=self.selection_policy,
                       source_initial_available_bytes=self.disk_usage.get(str(source.root), {}).get("available_bytes"),
                       original_initial_available_bytes=self.disk_usage.get(str(duplicate.root), {}).get("available_bytes"),
                       source_inode=list(identity(source.snapshot)),
@@ -1152,17 +1116,13 @@ class Engine:
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("-r", "--real-run", action="store_true", help="apply verified deduplication")
-    mode.add_argument("-d", "--dry-run", action="store_true", help="preview only (default)")
-    parser.add_argument("--mode", choices=("general", "torrent"),
-                        help="general: all content duplicates; torrent: require a master copy (default: general with a directory, legacy torrent otherwise)")
+    execution = parser.add_mutually_exclusive_group()
+    execution.add_argument("-r", "--real-run", action="store_true", help="apply verified deduplication")
+    execution.add_argument("-d", "--dry-run", action="store_true", help="preview only (default; this flag is optional)")
     parser.add_argument("--directory", "--source-dir", dest="directories", action="append", default=[], metavar="PATH",
                         help="recursively scan a /mnt/user/share directory across array disks; repeatable; explicit physical directories are also supported")
     parser.add_argument("--master-dir", dest="master_dirs", action="append", default=[], metavar="PATH",
-                        help="torrent master directory, scanned in addition to input directories; repeatable; implies torrent mode unless --mode is specified")
-    parser.add_argument("--include-same-disk", action="store_true",
-                        help="also consolidate separate duplicate inodes on the same disk by atomic hardlink replacement")
+                        help="directory supplying retained source files; scanned in addition to inputs; repeatable; unmatched groups are skipped")
     parser.add_argument("-p", "--process-file", help="absolute disk paths, one per LF-delimited line")
     parser.add_argument("-0", "--null", action="store_true", help="input list is NUL-delimited (requires -p)")
     parser.add_argument("-e", "--exclude", action="append", default=[], metavar="PATH", help="exclude a path/subtree; repeatable; quote wildcards")
@@ -1182,10 +1142,6 @@ def arguments(argv=None):
     logical_inputs = [path for path in args.disks if path.startswith("/mnt/user/")]
     args.directories.extend(logical_inputs)
     args.disks = [path for path in args.disks if path not in logical_inputs]
-    if args.mode is None:
-        args.mode = "torrent" if args.master_dirs or not args.directories else "general"
-    if args.master_dirs and args.mode != "torrent":
-        parser.error("--master-dir requires torrent mode")
     if args.process_file and (args.directories or args.master_dirs):
         parser.error("--process-file cannot be combined with --directory or --master-dir; it defines the exact inventory")
     if args.null and not args.process_file:
@@ -1197,7 +1153,7 @@ def arguments(argv=None):
     return args
 
 
-def validate_roots(paths, include_same_disk=False):
+def validate_roots(paths):
     if not paths:
         paths = [str(p) for p in Path("/mnt").glob("disk*") if DISK_RE.fullmatch(p.name) and os.path.ismount(p)]
     roots, devices = [], set()
@@ -1212,8 +1168,8 @@ def validate_roots(paths, include_same_disk=False):
             raise SafetyError("Repeated filesystem or disk mount: " + quoted(raw))
         devices.add(dev)
         roots.append(path)
-    if len(roots) < (1 if include_same_disk else 2):
-        raise SafetyError("Select at least %s mounted physical array disk(s)" % (1 if include_same_disk else 2))
+    if not roots:
+        raise SafetyError("Select at least one mounted physical array disk")
     return sorted(roots, key=lambda p: int(p.name[4:]))
 
 
@@ -1278,21 +1234,22 @@ def main(argv=None):
     try:
         if args.real_run and os.geteuid() != 0:
             raise SafetyError("Real runs require root privileges")
-        roots = validate_roots(args.disks, include_same_disk=args.include_same_disk)
+        roots = validate_roots(args.disks)
         journal = setup_logging(args)
-        LOG.info("Version %s; mode=%s; dedup_mode=%s; include_same_disk=%s; physical disks=%s", VERSION,
-                 "REAL" if args.real_run else "DRY RUN", args.mode, args.include_same_disk, ", ".join(map(str, roots)))
+        LOG.info("Version %s; execution=%s; source_selection=%s; physical disks=%s", VERSION,
+                 "REAL" if args.real_run else "DRY RUN",
+                 "master-directory" if args.master_dirs else "most-available-bytes", ", ".join(map(str, roots)))
         for directory in args.directories:
             LOG.info("Input directory: %s (mapped to physical array paths)", quoted(directory))
         for directory in args.master_dirs:
-            LOG.info("Torrent master directory: %s", quoted(directory))
+            LOG.info("Master source directory: %s", quoted(directory))
         if args.real_run:
             LOG.warning("Writers and Mover must already be paused; the lock only coordinates this script")
         with run_lock(args.real_run):
             engine = Engine(args, roots, journal=journal)
             counts = engine.run()
-            journal.write("RUN_COMPLETE", real_run=args.real_run, dedup_mode=args.mode,
-                          include_same_disk=args.include_same_disk, counts=counts)
+            journal.write("RUN_COMPLETE", real_run=args.real_run,
+                          source_selection=engine.selection_policy, counts=counts)
             LOG.info("Summary: %s", json.dumps(counts, sort_keys=True))
         return 0
     except KeyboardInterrupt:
@@ -1313,3 +1270,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

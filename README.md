@@ -1,4 +1,4 @@
-# Unraid Cross-Disk Deduplicator — v3.0.0
+# Unraid Cross-Disk Deduplicator — v3.1.0
 
 Consolidate identical files from different **physical array disks** onto a retained copy's disk. General mode chooses an existing copy by available disk space; torrent mode retains a file from a master directory. Each replacement preserves the old copy's relative path and uses a same-filesystem hardlink. Default operation is **dry-run**.
 
@@ -33,9 +33,32 @@ After:  /mnt/disk3/books/Author/book.pdf
 
 The two remaining paths share the retained inode. Both logical `/mnt/user/books/...` paths are preserved. Files do not need matching names or relative paths. SHA-256 and a single byte-for-byte comparison establish equality. No second full content comparison is performed after linking.
 
-This is cross-disk consolidation. Independent duplicates already on the retained disk are left alone. The script chooses among disks that already contain a matching copy; it does not copy data to an unrelated empty disk or move unique files for balancing. A destination already occupied by a different inode stops that action, even if its contents match; same-disk repair is outside this mode.
+By default this is cross-disk consolidation: independent duplicates already on the retained disk are left alone. Add `--include-same-disk` to also consolidate separate duplicate inodes within a disk. The script chooses among disks that already contain a matching copy; it does not copy data to an unrelated empty disk or move unique files for balancing. A cross-disk destination occupied by a different inode still stops that action unless its eligible same-disk copy was consolidated first.
 
 After reviewing the dry-run, use the same arguments with `--real-run` while writers and Mover remain paused.
+
+## Include duplicates on the same disk
+
+Files with equal hashes can still occupy separate inodes on one disk. Older versions deliberately skipped these files. For example, a torrent and media copy on disk2 both reporting `links=1` are separate copies when their inode numbers differ. To include them in either mode, add:
+
+```bash
+--include-same-disk
+```
+
+For torrent/media consolidation:
+
+```bash
+python3 ./unraid-cross-disk-deduplicator.py --mode torrent \
+  --directory /mnt/user/data/media/tv/1670 \
+  --master-dir /mnt/user/data/torrents/archived \
+  --include-same-disk --dry-run
+```
+
+The retained source keeps its inode. After one byte-for-byte comparison, the script creates an exclusive `.unraid-dedup-<operation>.tmp` hardlink beside the old media file, syncs it, checks source/original/temp identities and metadata, then uses an atomic rename to replace the old media entry. The media pathname remains present throughout replacement. There is no second content read. Already-hardlinked paths are left alone.
+
+Eligible same-disk copies on the retained disk are consolidated before cross-disk copies; this resolves matching destination collisions while preserving the existing fullest-first order for other disks. Target scopes, master priority, exclusions and metadata checks still apply. `--allow-metadata-change` remains a separate choice and does not enable same-disk processing by itself. This option permits selecting a single physical disk, for example appending `/mnt/disk2`.
+
+Default commands retain cross-disk-only behavior and now report how many same-disk-only **size groups** were not hashed. Those size groups are candidates, not confirmed content duplicates.
 
 ## Torrent mode: retain a master copy
 
@@ -91,7 +114,7 @@ This does not create hardlinks across filesystems. It creates the library hardli
 4. Use `/mnt/user/<share>/...` with `--directory` or as a positional input directory. Physical `/mnt/diskN` mount roots optionally limit participating disks. `/mnt/user0`, cache/pool mounts, Unassigned Devices and symlinked roots are unsupported. Physical subdirectories are accepted through directory/master flags, not as disk-root arguments.
 5. Run a dry-run first, inspect its log and journal, then invoke `--real-run`. Real runs require root. Dry runs need permission to read the selected files and Unraid configuration and write the log directory.
 
-The scanner skips symlinks, empty files, files directly at a disk's root and nested filesystems. It requires at least two mounted array filesystems. ZFS datasets or Btrfs subvolumes that present separate device IDs are skipped rather than assumed to support hardlinks.
+The scanner skips symlinks, empty files, files directly at a disk's root and nested filesystems. It requires at least two mounted array filesystems by default, or one with `--include-same-disk`. ZFS datasets or Btrfs subvolumes that present separate device IDs are skipped rather than assumed to support hardlinks.
 
 ## Installation and first dry-run
 
@@ -135,6 +158,7 @@ python3 ./unraid-cross-disk-deduplicator.py --real-run \
 | `-d`, `--dry-run` | Preview only; default. Writes logs/journal, but does not change media or create media directories. Reads may update access times. |
 | `-r`, `--real-run` | Apply verified operations; requires root. Cannot be combined with `-d`. |
 | `--mode general\|torrent` | General: any duplicate content, retaining the roomiest existing copy. Torrent: require a master copy. A directory defaults to general; master arguments imply torrent; old commands remain torrent mode. |
+| `--include-same-disk` | Also replace separate duplicate inodes on the same disk using an adjacent hardlink and atomic rename. Default is cross-disk-only. |
 | `--directory PATH`, `--source-dir PATH` | Recursive input directory; repeatable. `/mnt/user/<share>/...` maps across disks; a selected physical disk subdirectory is pinned to that disk. Positional `/mnt/user/...` directories are also accepted. |
 | `--master-dir PATH` | Configurable master directory for torrent mode; repeatable and scanned in addition to inputs. Master matches take priority over general free-space ranking. |
 | `-p FILE`, `--process-file FILE` | Read absolute physical disk paths from an LF-delimited file. A final LF is optional. Cannot be combined with directory/master scopes. |
@@ -165,10 +189,10 @@ Do not edit the NUL-delimited file with a line-oriented text editor. LF lists pr
 ## How duplicate detection works
 
 1. Scan the selected physical filesystems without following symlinks. A scan error stops processing before any deduplication.
-2. Group files by size. Hash only size groups spanning disks and containing an input candidate. Torrent mode additionally requires a master candidate; general mode has no torrent-path requirement. Matching basenames are **not** required.
+2. Group files by size. Hash only size groups spanning disks and containing an input candidate. With `--include-same-disk`, distinct inodes on one disk are eligible too. Torrent mode additionally requires a master candidate; general mode has no torrent-path requirement. Matching basenames are **not** required.
 3. Calculate SHA-256 using streamed reads. Existing hardlink aliases share a checksum calculation when their inode and recorded metadata match. A hashing error aborts the whole plan before mutations.
 4. Group matching content and choose the retained source according to the selected mode and startup space snapshot. Legacy torrent detection matches whole `torrent`/`torrents` directory components, case-insensitively, not substrings such as `my-torrent-backups`.
-5. Process input copies on other disks, fullest first within each group. Same-disk duplicates are left alone. In torrent mode, groups without a master are left alone and reference copies outside input scopes are retained.
+5. Process input copies on other disks, fullest first within each group. Same-disk duplicates are left alone unless `--include-same-disk` is enabled; then eligible copies on the retained disk are handled first. In torrent mode, groups without a master are left alone and reference copies outside input scopes are retained.
 
 Inventory metadata is held in memory, proportional to file count; file contents are streamed. Hashing and comparisons run sequentially to avoid simultaneous random reads across the array. After initial hashing, each candidate receives one full byte-for-byte comparison before replacement. Once the hardlink is ready, only inode/path identity and file metadata are checked; neither file's contents are read again. This removes the second full comparison from earlier versions while retaining change detection through recorded metadata. All writers and Mover must remain paused.
 
@@ -219,10 +243,14 @@ Each invocation that passes disk validation creates:
 | `LINK_READY` | Replacement link exists and was synced. |
 | `VERIFIED` | File metadata rechecked after linking; `verification="inode-and-metadata"` in v2.3.1 and later. Content comparison already occurred before linking; final path/inode checks still precede removal. Older versions also repeated the content comparison here. |
 | `ORIGINAL_REMOVED` | Original directory entry removed and its parent synced. |
+| `REPLACE_STARTED` | Same-disk rename intent persisted before final path checks and atomic replacement. The call may or may not have occurred if the run stopped here. |
+| `ORIGINAL_REPLACED` | Same-disk original pathname atomically replaced with the retained inode and its directory synced. Records include `temporary_link` and `replacement_method`. |
 | `LINK_ROLLED_BACK` | Script removed its newly created link before original removal. |
 | `RUN_COMPLETE` | Invocation finished; includes summary counters. |
 
 After interruption or failure, keep writers paused and inspect the latest journal. An operation without `ORIGINAL_REMOVED` can still have completed removal if it stopped between unlinking and recording that event. **Check actual paths and inode identities before taking recovery actions.** Do not blindly replay journal commands or delete either path.
+
+For same-disk operations, absence of `ORIGINAL_REPLACED` likewise does not prove that rename did not occur. Once replacement may have started, the script retains the result instead of rolling back. A temporary hardlink may remain after an interrupted or failed rename; its exact path is journaled. Inspect both path identities before removing leftover temporary entries. Before rename intent, cleanup removes only the script's verified temporary link and retains the original. A fresh run recognizes completed replacements as already hardlinked.
 
 Run a fresh dry-run to re-scan and revalidate the remaining state. A subsequent real run can finish cases where both the verified hardlink and old copy remain. If rollback retained the original and removed the new link, a fresh run can process the original again. Keep journals until the result has been reviewed; remove old journals manually when no longer needed.
 
@@ -244,3 +272,4 @@ This version handles **array disks only**. Cache/pool copies are outside the inv
 Files accessed through physical `/mnt/diskN` paths will move to a different physical path. User-share visibility depends on Unraid share settings. Mover, filesystem conversions and tools that copy/recreate files may change hardlink relationships later; verify them after storage changes.
 
 The script does not configure torrent clients, Radarr, Sonarr, container mappings, or Mover. Run it on the Unraid host with appropriate access. A host command is used here because disk-root and mount validation must see the host's physical filesystems.
+

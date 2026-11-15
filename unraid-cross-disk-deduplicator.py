@@ -4,6 +4,7 @@
 General mode retains existing copies by available disk space. Torrent mode
 retains a configurable master copy. User-share directories are expanded to
 physical disk paths; file content is never read or written through /mnt/user.
+Use --include-same-disk to also replace independent copies within a disk.
 
 All filesystem operations use pinned directory descriptors and reject symlinks.
 Writers and Mover MUST be paused: a cooperative lock cannot stop other programs.
@@ -33,7 +34,7 @@ import time
 import uuid
 from collections import defaultdict
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 CHUNK = 1024 * 1024
 DISK_RE = re.compile(r"disk[1-9][0-9]*\Z")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -485,6 +486,7 @@ class Engine:
         self.operation_detail = ""
         self.legacy_torrent = self.mode == "torrent" and not self.directory_scopes and not self.master_scopes
         self.disk_usage = {}
+        self.include_same_disk = getattr(args, "include_same_disk", False)
 
     def close(self):
         self.progress.close()
@@ -531,7 +533,8 @@ class Engine:
             LOG.info("Disk usage snapshot: %s; total=%s; used=%s; available=%s (%.1f%%)",
                      quoted(disk.path), human_bytes(total), human_bytes(used), human_bytes(available),
                      100 * available / total if total else 0)
-        self.record("DISK_USAGE_SNAPSHOT", dedup_mode=self.mode, selection_metric="available-bytes",
+        self.record("DISK_USAGE_SNAPSHOT", dedup_mode=self.mode, include_same_disk=self.include_same_disk,
+                    selection_metric="available-bytes",
                     disks=[dict(path=key, **value) for key, value in self.disk_usage.items()])
 
     def is_target(self, entry):
@@ -543,7 +546,9 @@ class Engine:
         return entry.torrent
 
     def eligible_group(self, entries):
-        return (len({str(e.root) for e in entries}) > 1
+        placement_ok = (len({identity(e.snapshot) for e in entries}) > 1 if self.include_same_disk
+                        else len({str(e.root) for e in entries}) > 1)
+        return (placement_ok
                 and any(self.is_target(e) for e in entries)
                 and (self.mode == "general" or any(self.is_master(e) for e in entries)))
 
@@ -694,7 +699,17 @@ class Engine:
             by_size[entry.snapshot.st_size].append(entry)
         hashed = {}
         groups = []
-        self.progress.start("Selecting cross-disk hashing candidates")
+        self.progress.start("Selecting hashing candidates")
+        if not self.include_same_disk:
+            skipped = sum(1 for entries in by_size.values()
+                          if len({str(e.root) for e in entries}) == 1
+                          and len({identity(e.snapshot) for e in entries}) > 1
+                          and any(self.is_target(e) for e in entries)
+                          and (self.mode == "general" or any(self.is_master(e) for e in entries)))
+            self.counts["same_disk_size_groups_skipped"] = skipped
+            if skipped:
+                LOG.info("Cross-disk-only mode: %s same-disk-only size groups not hashed; "
+                         "use --include-same-disk to inspect/consolidate them", skipped)
         sizes = [size for size in sorted(by_size) if self.eligible_group(by_size[size])]
         total_inodes = total_bytes = total_paths = 0
         for size in sizes:
@@ -734,9 +749,10 @@ class Engine:
         # Complete hashing before any mutation; an I/O error aborts the whole plan.
         if self.errors:
             raise SafetyError("Hashing incomplete; no deduplication was performed")
-        LOG.info("Hashing complete: %s inodes; %s; %.1fs; %s cross-disk duplicate groups",
+        LOG.info("Hashing complete: %s inodes; %s; %.1fs; %s duplicate groups (%s)",
                  self.counts["inodes_hashed"], human_bytes(self.counts["bytes_hashed"]),
-                 time.monotonic() - started, len(groups))
+                 time.monotonic() - started, len(groups),
+                 "same- and cross-disk" if self.include_same_disk else "cross-disk")
         return groups
 
     def record(self, event, **fields):
@@ -830,8 +846,16 @@ class Engine:
                          else "most available bytes among existing copies"),
                      human_bytes(self.disk_usage[str(source.root)]["available_bytes"]))
             for duplicate in sorted(group, key=lambda e: (
+                    0 if self.include_same_disk and e.root == source.root else 1,
                     self.disk_usage[str(e.root)]["available_bytes"], os.fsencode(e.path))):
-                if duplicate.root == source.root or not self.is_target(duplicate):
+                if not self.is_target(duplicate):
+                    continue
+                if identity(duplicate.snapshot) == identity(source.snapshot):
+                    if duplicate.path != source.path:
+                        self.counts["already_hardlinked_skipped"] += 1
+                    continue
+                if duplicate.root == source.root and not self.include_same_disk:
+                    self.counts["same_disk_copies_skipped"] += 1
                     continue
                 try:
                     self.operation_detail = "duplicate group=%s/%s; planned=%s; completed=%s; metadata skips=%s" % (
@@ -851,6 +875,11 @@ class Engine:
         return dict(self.counts)
 
     def deduplicate(self, source, duplicate):
+        same_disk = source.root == duplicate.root
+        if same_disk and not self.include_same_disk:
+            raise SafetyError("Same-disk replacement requires --include-same-disk")
+        if identity(source.snapshot) == identity(duplicate.snapshot):
+            return
         source_disk, old_disk = self.roots[str(source.root)], self.roots[str(duplicate.root)]
         source_disk.check()
         old_disk.check()
@@ -859,8 +888,11 @@ class Engine:
         if self.excluded(target):
             raise SafetyError("Replacement path is excluded: " + quoted(target))
         operation = uuid.uuid4().hex
+        temporary_name = ".unraid-dedup-" + operation + ".tmp" if same_disk else None
         fields = dict(operation=operation, source=str(source.path), original=str(duplicate.path),
                       target=str(target), sha256=source.digest,
+                      replacement_method="atomic-rename" if same_disk else "link-then-unlink",
+                      temporary_link=str(duplicate.path.parent / temporary_name) if same_disk else None,
                       dedup_mode=self.mode,
                       source_initial_available_bytes=self.disk_usage.get(str(source.root), {}).get("available_bytes"),
                       original_initial_available_bytes=self.disk_usage.get(str(duplicate.root), {}).get("available_bytes"),
@@ -879,7 +911,8 @@ class Engine:
                 if stamp(source_before) != stamp(source.snapshot) or stamp(old_before) != stamp(duplicate.snapshot):
                     raise ChangedFile("File changed after opening and before final comparison")
                 # Detect collisions before making permission changes to any participant.
-                self.validate_dry_target(source_disk, duplicate.relative, identity(source_before))
+                if not same_disk:
+                    self.validate_dry_target(source_disk, duplicate.relative, identity(source_before))
                 source_metadata, old_metadata = metadata(source_fd), metadata(old_fd)
                 if self.args.normalize_metadata:
                     source_attributes = projected_xattrs(source_metadata[3], normalized_mode(source_before))
@@ -911,10 +944,20 @@ class Engine:
                     self.counts["planned"] += 1
                     if duplicate.snapshot.st_nlink == 1:
                         self.counts["estimated_reclaimable_bytes"] += duplicate.snapshot.st_blocks * 512
-                    LOG.info("WOULD deduplicate: original=%s; retained_source=%s; "
-                             "replacement_hardlink=%s; then remove original=%s",
-                             quoted(duplicate.path), quoted(source.path),
-                             quoted(target), quoted(duplicate.path))
+                    if same_disk:
+                        LOG.info("WOULD atomically replace same-disk copy: original=%s; "
+                                 "retained_source=%s; replacement_hardlink=%s",
+                                 quoted(duplicate.path), quoted(source.path), quoted(target))
+                    else:
+                        LOG.info("WOULD deduplicate: original=%s; retained_source=%s; "
+                                 "replacement_hardlink=%s; then remove original=%s",
+                                 quoted(duplicate.path), quoted(source.path),
+                                 quoted(target), quoted(duplicate.path))
+                    return
+                if same_disk:
+                    self.replace_same_disk(source, duplicate, source_fd, old_fd,
+                                           source_parent, source_name, old_parent, old_name,
+                                           source_before, old_before, temporary_name, fields)
                     return
                 self.progress.start("Creating and syncing replacement hardlink", path=target,
                                     detail=self.operation_detail)
@@ -1005,6 +1048,83 @@ class Engine:
                                 LOG.error("Rollback failed; original retained: %s", ascii(str(exc)))
                         raise
 
+    def replace_same_disk(self, source, duplicate, source_fd, old_fd, source_parent,
+                          source_name, old_parent, old_name, source_before, old_before,
+                          temporary_name, fields):
+        """Prepare an adjacent hardlink, then atomically replace the old name.
+
+        No content reads occur here. Before rename, failure can remove only our
+        temporary link. Once rename may have started, retain the result and let
+        the journal/stat checks resolve an interrupted syscall.
+        """
+        disk = self.roots[str(source.root)]
+        created = False
+        replacement_started = False
+        try:
+            self.progress.start("Preparing same-disk replacement hardlink", path=duplicate.path,
+                                detail=self.operation_detail)
+            os.link(source_name, temporary_name, src_dir_fd=source_parent,
+                    dst_dir_fd=old_parent, follow_symlinks=False)
+            created = True
+            temporary_stat = os.stat(temporary_name, dir_fd=old_parent, follow_symlinks=False)
+            if not stat.S_ISREG(temporary_stat.st_mode) or identity(temporary_stat) != identity(os.fstat(source_fd)):
+                raise ChangedFile("Temporary hardlink does not match retained source")
+            os.fsync(source_fd)
+            os.fsync(old_parent)
+            self.record("LINK_READY", **fields)
+            source_now, old_now = os.fstat(source_fd), os.fstat(old_fd)
+            if content_identity(source_now) != content_identity(source_before) or stamp(old_now) != stamp(old_before):
+                raise ChangedFile("File changed during same-disk replacement preparation")
+            self.record("VERIFIED", verification="inode-and-metadata", **fields)
+            self.record("REPLACE_STARTED", **fields)
+            # Journal fsyncs may take time; final path/metadata checks follow
+            # those writes immediately before rename, as with cross-disk unlink.
+            disk.check()
+            for relative, expected in ((source.relative, source_parent), (duplicate.relative, old_parent)):
+                with disk.parent(relative) as (fresh, _):
+                    if identity(os.fstat(fresh)) != identity(os.fstat(expected)):
+                        raise ChangedFile("Same-disk parent directory moved")
+            if stamp(os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)) != stamp(source_now):
+                raise ChangedFile("Retained source changed before same-disk rename")
+            if stamp(os.stat(old_name, dir_fd=old_parent, follow_symlinks=False)) != stamp(old_now):
+                raise ChangedFile("Original changed before same-disk rename")
+            current = os.stat(temporary_name, dir_fd=old_parent, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode) or identity(current) != identity(source_now):
+                raise ChangedFile("Temporary hardlink changed before same-disk rename")
+            self.progress.start("Atomically replacing same-disk copy", path=duplicate.path,
+                                detail=self.operation_detail)
+            replacement_started = True
+            os.replace(temporary_name, old_name, src_dir_fd=old_parent, dst_dir_fd=old_parent)
+            os.fsync(old_parent)
+            replacement = os.stat(old_name, dir_fd=old_parent, follow_symlinks=False)
+            if not stat.S_ISREG(replacement.st_mode) or identity(replacement) != identity(os.fstat(source_fd)):
+                raise ChangedFile("Same-disk replacement inode verification failed")
+            old_identity = identity(duplicate.snapshot)
+            old_after = os.fstat(old_fd)
+            for alias in self.inventory:
+                if identity(alias.snapshot) == old_identity:
+                    alias.snapshot = old_after
+            duplicate.snapshot = replacement
+            self.record("ORIGINAL_REPLACED", **fields)
+            self.counts["completed"] += 1
+            self.counts["same_disk_completed"] += 1
+            if old_now.st_nlink == 1:
+                self.counts["estimated_reclaimable_bytes"] += old_now.st_blocks * 512
+            LOG.info("DEDUPLICATED SAME DISK: replaced=%s; retained_source=%s; inode=%s",
+                     quoted(duplicate.path), quoted(source.path), replacement.st_ino)
+        except BaseException:
+            if created and not replacement_started:
+                try:
+                    temporary = os.stat(temporary_name, dir_fd=old_parent, follow_symlinks=False)
+                    original = os.stat(old_name, dir_fd=old_parent, follow_symlinks=False)
+                    if identity(temporary) == identity(os.fstat(source_fd)) and identity(original) == identity(os.fstat(old_fd)):
+                        os.unlink(temporary_name, dir_fd=old_parent)
+                        os.fsync(old_parent)
+                        self.record("LINK_ROLLED_BACK", **fields)
+                except OSError as exc:
+                    LOG.error("Same-disk temporary-link cleanup failed: %s", ascii(str(exc)))
+            raise
+
     @staticmethod
     def validate_dry_target(disk, relative, source_identity):
         parts = parts_of(relative)
@@ -1041,6 +1161,8 @@ def arguments(argv=None):
                         help="recursively scan a /mnt/user/share directory across array disks; repeatable; explicit physical directories are also supported")
     parser.add_argument("--master-dir", dest="master_dirs", action="append", default=[], metavar="PATH",
                         help="torrent master directory, scanned in addition to input directories; repeatable; implies torrent mode unless --mode is specified")
+    parser.add_argument("--include-same-disk", action="store_true",
+                        help="also consolidate separate duplicate inodes on the same disk by atomic hardlink replacement")
     parser.add_argument("-p", "--process-file", help="absolute disk paths, one per LF-delimited line")
     parser.add_argument("-0", "--null", action="store_true", help="input list is NUL-delimited (requires -p)")
     parser.add_argument("-e", "--exclude", action="append", default=[], metavar="PATH", help="exclude a path/subtree; repeatable; quote wildcards")
@@ -1075,7 +1197,7 @@ def arguments(argv=None):
     return args
 
 
-def validate_roots(paths):
+def validate_roots(paths, include_same_disk=False):
     if not paths:
         paths = [str(p) for p in Path("/mnt").glob("disk*") if DISK_RE.fullmatch(p.name) and os.path.ismount(p)]
     roots, devices = [], set()
@@ -1090,8 +1212,8 @@ def validate_roots(paths):
             raise SafetyError("Repeated filesystem or disk mount: " + quoted(raw))
         devices.add(dev)
         roots.append(path)
-    if len(roots) < 2:
-        raise SafetyError("Select at least two mounted physical array disks")
+    if len(roots) < (1 if include_same_disk else 2):
+        raise SafetyError("Select at least %s mounted physical array disk(s)" % (1 if include_same_disk else 2))
     return sorted(roots, key=lambda p: int(p.name[4:]))
 
 
@@ -1156,10 +1278,10 @@ def main(argv=None):
     try:
         if args.real_run and os.geteuid() != 0:
             raise SafetyError("Real runs require root privileges")
-        roots = validate_roots(args.disks)
+        roots = validate_roots(args.disks, include_same_disk=args.include_same_disk)
         journal = setup_logging(args)
-        LOG.info("Version %s; mode=%s; dedup_mode=%s; physical disks=%s", VERSION,
-                 "REAL" if args.real_run else "DRY RUN", args.mode, ", ".join(map(str, roots)))
+        LOG.info("Version %s; mode=%s; dedup_mode=%s; include_same_disk=%s; physical disks=%s", VERSION,
+                 "REAL" if args.real_run else "DRY RUN", args.mode, args.include_same_disk, ", ".join(map(str, roots)))
         for directory in args.directories:
             LOG.info("Input directory: %s (mapped to physical array paths)", quoted(directory))
         for directory in args.master_dirs:
@@ -1169,7 +1291,8 @@ def main(argv=None):
         with run_lock(args.real_run):
             engine = Engine(args, roots, journal=journal)
             counts = engine.run()
-            journal.write("RUN_COMPLETE", real_run=args.real_run, dedup_mode=args.mode, counts=counts)
+            journal.write("RUN_COMPLETE", real_run=args.real_run, dedup_mode=args.mode,
+                          include_same_disk=args.include_same_disk, counts=counts)
             LOG.info("Summary: %s", json.dumps(counts, sort_keys=True))
         return 0
     except KeyboardInterrupt:
